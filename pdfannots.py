@@ -6,6 +6,7 @@ Extracts annotations from a PDF file in markdown format for use in reviewing.
 """
 
 import sys, io, textwrap, argparse
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
 from pdfminer.pdfpage import PDFPage
 from pdfminer.layout import LAParams, LTContainer, LTAnno, LTChar, LTTextBox
@@ -16,6 +17,7 @@ from pdfminer.psparser import PSLiteralTable, PSLiteral
 import pdfminer.pdftypes as pdftypes
 import pdfminer.settings
 import pdfminer.utils
+import pypandoc
 
 pdfminer.settings.STRICT = False
 
@@ -35,7 +37,7 @@ SUBSTITUTIONS = {
 ANNOT_SUBTYPES = frozenset({'Text', 'Highlight', 'Squiggly', 'StrikeOut', 'Underline'})
 ANNOT_NITS = frozenset({'Squiggly', 'StrikeOut', 'Underline'})
 
-COLUMNS_PER_PAGE = 2 # default only, changed via a command-line parameter
+COLUMNS_PER_PAGE = 1 # default only, changed via a command-line parameter
 
 DEBUG_BOXHIT = False
 
@@ -262,6 +264,103 @@ def getannots(pdfannots, page):
 
     return annots
 
+def resolve_dest(doc, dest):
+    if isinstance(dest, bytes):
+        dest = pdftypes.resolve1(doc.get_dest(dest))
+    elif isinstance(dest, PSLiteral):
+        dest = pdftypes.resolve1(doc.get_dest(dest.name))
+    if isinstance(dest, dict):
+        dest = dest['D']
+    return dest
+
+class Outline:
+    def __init__(self, title, dest, pos):
+        self.title = title
+        self.dest = dest
+        self.pos = pos
+
+def get_outlines(doc, pageslist, pagesdict):
+    result = []
+    for (_, title, destname, actionref, _) in doc.get_outlines():
+        if destname is None and actionref:
+            action = pdftypes.resolve1(actionref)
+            if isinstance(action, dict):
+                subtype = action.get('S')
+                if subtype is PSLiteralTable.intern('GoTo'):
+                    destname = action.get('D')
+        if destname is None:
+            continue
+        dest = resolve_dest(doc, destname)
+
+        # consider targets of the form [page /XYZ left top zoom]
+        if dest[1] is PSLiteralTable.intern('XYZ'):
+            (pageref, _, targetx, targety) = dest[:4]
+
+            if type(pageref) is int:
+                page = pageslist[pageref]
+            elif isinstance(pageref, pdftypes.PDFObjRef):
+                page = pagesdict[pageref.objid]
+            else:
+                sys.stderr.write('Warning: unsupported pageref in outline: %s\n' % pageref)
+                page = None
+
+            if page:
+                pos = Pos(page, targetx, targety)
+                result.append(Outline(title, destname, pos))
+    return result
+
+
+def process_file(fh, pagerange, emit_progress):
+    rsrcmgr = PDFResourceManager()
+    laparams = LAParams()
+    device = RectExtractor(rsrcmgr, laparams=laparams)
+    interpreter = PDFPageInterpreter(rsrcmgr, device)
+    parser = PDFParser(fh)
+    doc = PDFDocument(parser)
+
+    pageslist = [] # pages in page order
+    pagesdict = {} # map from PDF page object ID to Page object
+    allannots = []
+
+    for (pageno, pdfpage) in enumerate(PDFPage.create_pages(doc)):
+        if pagerange != [] and (pageno + 1) not in pagerange: continue
+        page = Page(pageno, pdfpage.mediabox)
+        pageslist.append(page)
+        pagesdict[pdfpage.pageid] = page
+        if pdfpage.annots:
+            # emit progress indicator
+            if emit_progress:
+                sys.stderr.write((" " if pageno > 0 else "") + "%d" % (pageno + 1))
+                sys.stderr.flush()
+
+            pdfannots = []
+            for a in pdftypes.resolve1(pdfpage.annots):
+                if isinstance(a, pdftypes.PDFObjRef):
+                    pdfannots.append(a.resolve())
+                else:
+                    sys.stderr.write('Warning: unknown annotation: %s\n' % a)
+
+            page.annots = getannots(pdfannots, page)
+            page.annots.sort()
+            device.setannots(page.annots)
+            interpreter.process_page(pdfpage)
+            allannots.extend(page.annots)
+
+    if emit_progress:
+        sys.stderr.write("\n")
+
+    outlines = []
+    try:
+        outlines = get_outlines(doc, pageslist, pagesdict)
+    except PDFNoOutlines:
+        if emit_progress:
+            sys.stderr.write("Document doesn't include outlines (\"bookmarks\")\n")
+    except Exception as ex:
+        sys.stderr.write("Warning: failed to retrieve outlines: %s\n" % ex)
+
+    device.close()
+
+    return (allannots, outlines)
 
 class PrettyPrinter:
     """
@@ -277,7 +376,7 @@ class PrettyPrinter:
 
         self.BULLET_INDENT1 = " * "
         self.BULLET_INDENT2 = "   "
-        self.QUOTE_INDENT = self.BULLET_INDENT2 + "> "
+        self.QUOTE_INDENT = self.BULLET_INDENT2 + ">"
 
         if wrapcol:
             # for bullets, we need two text wrappers: one for the leading bullet on the first paragraph, one without
@@ -361,7 +460,7 @@ class PrettyPrinter:
         assert text or comment
 
         # compute the formatted position (and extra bit if needed) as a label
-        label = self.format_pos(annot) + (" " + extra if extra else "") + ":"
+        label = self.format_pos(annot) + (" " + extra if extra else "") + ":\n"
 
         # If we have short (single-paragraph, few words) text with a short or no
         # comment, and the text contains no embedded full stops or quotes, then
@@ -391,145 +490,72 @@ class PrettyPrinter:
 
     def printall(self, annots, outfile):
         for a in annots:
+            #to-do: add underline to underline subtype
             print(self.format_annot(a, a.tagname), file=outfile)
 
-    def printall_grouped(self, sections, annots, outfile):
-        """
-        sections controls the order of sections output
-                e.g.: ["highlights", "comments", "nits"]
-        """
+    def printall_grouped(self, subtypes, tags, annots, outfile):
+
         self._printheader_called = False
 
-        def printheader(name):
+        def printheader(header, h_level=1):
             # emit blank separator line if needed
             if self._printheader_called:
                 print("", file=outfile)
             else:
                 self._printheader_called = True
-            print("## " + name + "\n", file=outfile)
+            header = header.title()
+            print("{} {}\n".format("#"*h_level, header), file=outfile)
 
-        highlights = [a for a in annots if a.tagname == 'Highlight' and a.contents is None]
-        comments = [a for a in annots if a.tagname not in ANNOT_NITS and a.contents]
-        nits = [a for a in annots if a.tagname in ANNOT_NITS]
-
-        for secname in sections:
-            if highlights and secname == 'highlights':
-                printheader("Highlights")
-                for a in highlights:
-                    print(self.format_annot(a), file=outfile)
-
-            if comments and secname == 'comments':
-                printheader("Detailed comments")
-                for a in comments:
-                    print(self.format_annot(a), file=outfile)
-
-            if nits and secname == 'nits':
-                printheader("Nits")
-                for a in nits:
-                    if a.tagname == 'StrikeOut':
-                        extra = "delete"
-                    else:
-                        extra = None
-                    print(self.format_annot(a, extra), file=outfile)
-
-
-def resolve_dest(doc, dest):
-    if isinstance(dest, bytes):
-        dest = pdftypes.resolve1(doc.get_dest(dest))
-    elif isinstance(dest, PSLiteral):
-        dest = pdftypes.resolve1(doc.get_dest(dest.name))
-    if isinstance(dest, dict):
-        dest = dest['D']
-    return dest
-
-class Outline:
-    def __init__(self, title, dest, pos):
-        self.title = title
-        self.dest = dest
-        self.pos = pos
-
-def get_outlines(doc, pageslist, pagesdict):
-    result = []
-    for (_, title, destname, actionref, _) in doc.get_outlines():
-        if destname is None and actionref:
-            action = pdftypes.resolve1(actionref)
-            if isinstance(action, dict):
-                subtype = action.get('S')
-                if subtype is PSLiteralTable.intern('GoTo'):
-                    destname = action.get('D')
-        if destname is None:
-            continue
-        dest = resolve_dest(doc, destname)
-
-        # consider targets of the form [page /XYZ left top zoom]
-        if dest[1] is PSLiteralTable.intern('XYZ'):
-            (pageref, _, targetx, targety) = dest[:4]
-
-            if type(pageref) is int:
-                page = pageslist[pageref]
-            elif isinstance(pageref, pdftypes.PDFObjRef):
-                page = pagesdict[pageref.objid]
+        
+        #categorizing
+        annots_categorized = {subtype:[] for subtype in subtypes}    
+        if tags:
+            for subtype in subtypes: 
+                annots_categorized[subtype] = {tag:[] for tag in tags} 
+                #this method will make the keys point to their own empty lists.
+                #Don't use annots_categorized['underlines_tagged'] = dict.fromkeys(tags, None) 
+                #here, which creates a new dictionary where every item in seq will
+                #map to the same optional argument value. So change one will result in changing all.
+                annots_categorized[subtype]['untagged'] = [] #for storing annotations without a tag. 
+            for a in annots:
+                for subtype in subtypes:
+                    flag = 0 #for counting how many times an element misses tags
+                    for tag in tags:
+                        if a.contents is not None and a.tagname == subtype and tag in a.contents:
+                            annots_categorized[subtype][tag].append(a)
+                        else:
+                            flag += 1
+                    #if this element misses all tags, it will be added to the 'untagged' list:
+                    if flag == len(tags) and a.tagname == subtype: 
+                        annots_categorized[subtype]['untagged'].append(a)
+        else:
+            for a in annots:
+                for subtype in subtypes:
+                    if a.tagname == subtype:
+                        annots_categorized[subtype].append(a)
+        
+        #printing
+        for subtype in subtypes:
+            if any(item != [] for item in annots_categorized[subtype].values()): printheader(subtype, 1)
+            if tags:
+                for tag in tags:
+                    if annots_categorized[subtype][tag] == []: continue #if no annotation contains this tag, skip and don't print anything
+                    printheader(tag.replace('**', ''), 2)
+                    for a in annots_categorized[subtype][tag]:
+                        a.contents = a.contents.replace(tag, '')
+                        print(self.format_annot(a), file=outfile)
+                if annots_categorized[subtype]['untagged'] != []: 
+                    printheader("untagged", 2)
+                    for a in annots_categorized[subtype]['untagged']:
+                            print(self.format_annot(a), file=outfile)
             else:
-                sys.stderr.write('Warning: unsupported pageref in outline: %s\n' % pageref)
-                page = None
+                for a in annots_categorized[subtype]:
+                    print(self.format_annot(a), file=outfile)
 
-            if page:
-                pos = Pos(page, targetx, targety)
-                result.append(Outline(title, destname, pos))
-    return result
-
-
-def process_file(fh, emit_progress):
-    rsrcmgr = PDFResourceManager()
-    laparams = LAParams()
-    device = RectExtractor(rsrcmgr, laparams=laparams)
-    interpreter = PDFPageInterpreter(rsrcmgr, device)
-    parser = PDFParser(fh)
-    doc = PDFDocument(parser)
-
-    pageslist = [] # pages in page order
-    pagesdict = {} # map from PDF page object ID to Page object
-    allannots = []
-
-    for (pageno, pdfpage) in enumerate(PDFPage.create_pages(doc)):
-        page = Page(pageno, pdfpage.mediabox)
-        pageslist.append(page)
-        pagesdict[pdfpage.pageid] = page
-        if pdfpage.annots:
-            # emit progress indicator
-            if emit_progress:
-                sys.stderr.write((" " if pageno > 0 else "") + "%d" % (pageno + 1))
-                sys.stderr.flush()
-
-            pdfannots = []
-            for a in pdftypes.resolve1(pdfpage.annots):
-                if isinstance(a, pdftypes.PDFObjRef):
-                    pdfannots.append(a.resolve())
-                else:
-                    sys.stderr.write('Warning: unknown annotation: %s\n' % a)
-
-            page.annots = getannots(pdfannots, page)
-            page.annots.sort()
-            device.setannots(page.annots)
-            interpreter.process_page(pdfpage)
-            allannots.extend(page.annots)
-
-    if emit_progress:
-        sys.stderr.write("\n")
-
-    outlines = []
-    try:
-        outlines = get_outlines(doc, pageslist, pagesdict)
-    except PDFNoOutlines:
-        if emit_progress:
-            sys.stderr.write("Document doesn't include outlines (\"bookmarks\")\n")
-    except Exception as ex:
-        sys.stderr.write("Warning: failed to retrieve outlines: %s\n" % ex)
-
-    device.close()
-
-    return (allannots, outlines)
-
+    def dumping(self, subtypes, tags, annots, outfile):
+        pass
+        #to-do: adding a "tag" key (a list) to annots and 
+        #dumping annots to an xml file
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
@@ -539,19 +565,28 @@ def parse_args():
 
     g = p.add_argument_group('Basic options')
     g.add_argument("-p", "--progress", default=False, action="store_true",
-                   help="emit progress information")
-    g.add_argument("-o", metavar="OUTFILE", type=argparse.FileType("w"), dest="output",
+                   help="print progress information")
+    g.add_argument("-o", metavar="OUTFILE", type=argparse.FileType("w", encoding='utf-8'), dest="output",
                    default=sys.stdout, help="output file (default is stdout)")
-    g.add_argument("-n", "--cols", default=2, type=int, metavar="COLS", dest="cols",
-                   help="number of columns per page in the document (default: 2)")
+    g.add_argument("--pdf",dest="pdfconversion", default=False, action="store_true",
+                   help="whether to convert md to pdf")
+    g.add_argument("-n", "--cols", default=1, type=int, metavar="COLS", dest="cols",
+                   help="number of columns per page in the document (default: 1)")
 
     g = p.add_argument_group('Options controlling output format')
-    allsects = ["highlights", "comments", "nits"]
-    g.add_argument("-s", "--sections", metavar="SEC", nargs="*",
-                   choices=allsects, default=allsects,
-                   help=("sections to emit (default: %s)" % ', '.join(allsects)))
+
+    allsubtypes = ["Underline", "Text", "Squiggly", "Highlight"]
+    g.add_argument("-s", "--subtypes", metavar="SUBTYP", nargs="*",
+                   choices=allsubtypes, default=allsubtypes,
+                   help=("choose annotation subtypes to print (default: %s)" % ', '.join(allsubtypes)))
+    alltags = ["**Q**", "**about**", "**arg**", "**enemy**", "**method**", "**sig**"]
+    g.add_argument("-t", "--tags", metavar="TAG", nargs="*", default=alltags, 
+                   help=("self-defined tags (default: %s)" % ', '.join(alltags)))
+    pages = []
+    g.add_argument("-r", "--pagerange", metavar="PAGERANGE", nargs="*", default=pages, 
+                   help=("self-defined tags (format: e.g. 1 100) default: all pages)"))
     g.add_argument("--no-group", dest="group", default=True, action="store_false",
-                   help="emit annotations in order, don't group into sections")
+                   help="print annotations in order, don't group according to annotation subtypes")
     g.add_argument("--print-filename", dest="printfilename", default=False, action="store_true",
                    help="print the filename when it has annotations")
     g.add_argument("-w", "--wrap", metavar="COLS", type=int,
@@ -565,9 +600,18 @@ def main():
 
     global COLUMNS_PER_PAGE
     COLUMNS_PER_PAGE = args.cols
-
+    
     for file in args.input:
-        (annots, outlines) = process_file(file, args.progress)
+
+        #dealing with pagerange
+        if args.pagerange != []:
+            page_start = int(args.pagerange[0])
+            page_end = int(args.pagerange[1]) + 1
+            pagerange = range(page_start,page_end)
+        else:
+            pagerange = []
+
+        (annots, outlines) = process_file(file, pagerange, args.progress)
 
         pp = PrettyPrinter(outlines, args.wrap)
 
@@ -575,9 +619,13 @@ def main():
             print("# File: '%s'\n" % file.name)
 
         if args.group:
-            pp.printall_grouped(args.sections, annots, args.output)
+            pp.printall_grouped(args.subtypes, args.tags, annots, args.output)
         else:
             pp.printall(annots, args.output)
+        
+        if args.pdfconversion is True:
+            pypandoc.convert_file(args.output.name, to='pdf', outputfile=args.output.name.replace('.md', '.pdf'), 
+            extra_args=['--pdf-engine=xelatex', '-V', 'CJKmainfont="SimSun"', '-V', 'geometry:margin=1in'])
 
     return 0
 
